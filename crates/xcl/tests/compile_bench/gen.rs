@@ -3,13 +3,14 @@
 //! values and addresses are not set up to compute anything.
 //!
 //! Register use: v0 is the lane id (read only), v1 the lane's byte offset for memory, v2.. the
-//! `vgprs` pool. s[2:3] is the memory base, s4.. the `sgprs` pool, s[64 + 2d] the EXEC saved by
-//! an `if` at depth d, s[80 + d] the counter of a loop at depth d.
+//! `vgprs` pool. s[2:3] is the memory base, s4.. the `sgprs` pool, s[32:35] the buffer's V#,
+//! s[40:47] the image's T#, s[48:51] its S#, s[64 + 2d] the EXEC saved by an `if` at depth d,
+//! s[80 + d] the counter of a loop at depth d.
 
 use xcl::gpu::rdna2::encode;
-use xcl::gpu::recomp::Options;
+use xcl::gpu::recomp::{CsInterface, Mode, Options};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Knobs {
     pub seed: u64,
     /// operations (ALU and memory instructions); the control flow comes on top
@@ -31,18 +32,31 @@ pub struct Knobs {
     /// percent of operations that are LDS reads / writes, and global or scalar memory accesses
     pub lds_pct: u32,
     pub mem_pct: u32,
+    /// percent of operations that are buffer loads / stores (V#), and image loads / samples (T#)
+    pub buffer_pct: u32,
+    pub image_pct: u32,
+    /// translate as a compute shader (64 threads, 4 user SGPRs) instead of a kernel
+    pub compute: bool,
 }
 
 impl Default for Knobs {
     fn default() -> Self {
-        Knobs { seed: 1, ops: 200, if_depth: 2, divergent_pct: 10, loops: 0, loop_depth: 1, loop_trips: 4, wave64: true, vgprs: 16, sgprs: 8, lds_pct: 5, mem_pct: 10 }
+        Knobs {
+            seed: 1, ops: 200, if_depth: 2, divergent_pct: 10, loops: 0, loop_depth: 1, loop_trips: 4, wave64: true, vgprs: 16, sgprs: 8,
+            lds_pct: 5, mem_pct: 10, buffer_pct: 0, image_pct: 0, compute: false,
+        }
     }
 }
 
 impl Knobs {
-    /// The recompiler options the program is meant for (kernel mode, its wave size).
+    /// The recompiler options the program is meant for: kernel or compute mode, its wave size.
     pub fn options(&self) -> Options {
-        Options { wave64: self.wave64, ..Options::default() }
+        let mode = if self.compute {
+            Mode::Compute(CsInterface { threads: [64, 1, 1], user_sgprs: 4, tid_components: 1, ..CsInterface::default() })
+        } else {
+            Mode::Kernel
+        };
+        Options { mode, wave64: self.wave64, ..Options::default() }
     }
 }
 
@@ -100,6 +114,19 @@ impl Gen<'_> {
                 inst("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", self.vgpr())], None)
             } else {
                 inst("DS_READ_B32", "ENC_DS", &[("VDST", self.vgpr()), ("ADDR", 1)], None)
+            };
+        }
+        let resources = self.k.mem_pct + self.k.lds_pct + self.k.buffer_pct;
+        if r < resources {
+            let name = if self.rng.below(2) == 0 { "BUFFER_LOAD_DWORD" } else { "BUFFER_STORE_DWORD" };
+            return inst(name, "ENC_MUBUF", &[("VDATA", self.vgpr()), ("VADDR", 1), ("SRSRC", 8), ("SOFFSET", 128), ("OFFSET", 4 * self.rng.below(256)), ("OFFEN", 1)], None);
+        }
+        if r < resources + self.k.image_pct {
+            // 2D at (v0, v1), one channel
+            return if self.rng.below(2) == 0 {
+                inst("IMAGE_LOAD", "ENC_MIMG", &[("VDATA", self.vgpr()), ("VADDR", 0), ("SRSRC", 10), ("DMASK", 1), ("DIM", 1), ("UNORM", 1)], None)
+            } else {
+                inst("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", self.vgpr()), ("VADDR", 0), ("SRSRC", 10), ("SSAMP", 12), ("DMASK", 1), ("DIM", 1)], None)
             };
         }
         // the rest: about one scalar operation for three vector ones, as in console programs
@@ -170,7 +197,7 @@ impl Gen<'_> {
 pub fn program(k: &Knobs) -> Vec<u8> {
     assert!((2..=254).contains(&k.vgprs) && (1..=16).contains(&k.sgprs), "{k:?}");
     assert!((1..=64).contains(&k.loop_trips) && k.loop_depth >= 1 && k.if_depth <= 8 && k.loop_depth <= 8, "{k:?}");
-    assert!(k.lds_pct + k.mem_pct <= 100 && k.divergent_pct <= 100, "{k:?}");
+    assert!(k.lds_pct + k.mem_pct + k.buffer_pct + k.image_pct <= 100 && k.divergent_pct <= 100, "{k:?}");
     let mut g = Gen { k, rng: Rng(k.seed) };
     let mut v = inst("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None); // v1 = lane * 4
     let (loops, levels) = (k.loops as usize, k.loop_depth as usize);

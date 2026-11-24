@@ -1,8 +1,9 @@
 //! The measurement: each generated program is translated to HLSL and compiled with DXC, one
 //! compile at a time, and its sizes and times are written as JSON and CSV.
 //!
-//! - `XCL_COMPILE_BENCH=full`: the full set (sizes up to 20 000 operations); unset: a small set
-//!   that runs in seconds, so CI and every test run go through the same code
+//! - `XCL_COMPILE_BENCH=full`: the full set (sizes up to 20 000 operations); `large`: only the
+//!   multi-megabyte programs (up to 40 000 operations); unset: a small set that runs in seconds,
+//!   so CI and every test run go through the same code
 //! - `XCL_COMPILE_BENCH_OUT=<folder>`: write `compile_bench.json` and `compile_bench.csv` there
 //! - `XCL_COMPILE_BENCH_REPS=<n>`: compiles per program (default 1, full set 3)
 //! - `XCL_COMPILE_BENCH_DXC_ARGS="-O1 …"`: extra DXC arguments; unset, `dxc.rs` picks the
@@ -90,6 +91,61 @@ pub fn full() -> Vec<Case> {
     v
 }
 
+/// The large set: only the multi-megabyte tail, where most of the compile time goes. Three
+/// shapes at 8 000, 20 000 and 40 000 operations, in both forms; the larger ones cross the
+/// source sizes at which `dxc.rs` lowers the optimisation level.
+pub fn large() -> Vec<Case> {
+    let mut v = Vec::new();
+    for ops in [8000, 20000, 40000] {
+        let shapes = [
+            ("base", Knobs { ops, ..Knobs::default() }),
+            ("divergent", Knobs { ops, if_depth: 6, divergent_pct: 40, ..Knobs::default() }),
+            ("resources", Knobs { ops, compute: true, mem_pct: 10, buffer_pct: 10, image_pct: 5, ..Knobs::default() }),
+        ];
+        for (shape, knobs) in shapes {
+            v.push(case(&format!("{shape}-{ops}"), knobs.clone(), false, 1, true));
+            v.push(case(&format!("{shape}-{ops}-split-4win"), knobs, true, 4, true));
+        }
+    }
+    v
+}
+
+/// The set's DXC times (each program's median), so the slow tail shows next to the typical
+/// program: the nearest-rank p90, the maximum, and the share of the total compile time spent
+/// on the slowest tenth of the programs (at least one).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Summary {
+    pub programs: usize,
+    pub dxc_ms_total: f64,
+    pub dxc_ms_median: f64,
+    pub dxc_ms_p90: f64,
+    pub dxc_ms_max: f64,
+    pub slowest_tenth_share: f64,
+}
+
+pub fn summary(rows: &[Row]) -> Summary {
+    let mut t: Vec<f64> = rows.iter().map(|r| r.dxc_ms_median).collect();
+    t.sort_by(f64::total_cmp);
+    let n = t.len();
+    let total: f64 = t.iter().sum();
+    let tenth: f64 = t.iter().rev().take(n.div_ceil(10)).sum();
+    Summary {
+        programs: n,
+        dxc_ms_total: total,
+        dxc_ms_median: if n > 0 { median(&t) } else { 0.0 },
+        dxc_ms_p90: if n > 0 { t[(n * 9).div_ceil(10) - 1] } else { 0.0 },
+        dxc_ms_max: t.last().copied().unwrap_or(0.0),
+        slowest_tenth_share: if total > 0.0 { tenth / total } else { 0.0 },
+    }
+}
+
+/// The rows from the slowest DXC compile to the fastest (ties by name).
+pub fn by_time(rows: &[Row]) -> Vec<&Row> {
+    let mut v: Vec<&Row> = rows.iter().collect();
+    v.sort_by(|a, b| b.dxc_ms_median.total_cmp(&a.dxc_ms_median).then_with(|| a.name.cmp(&b.name)));
+    v
+}
+
 fn median(v: &[f64]) -> f64 {
     let mut s = v.to_vec();
     s.sort_by(f64::total_cmp);
@@ -162,12 +218,12 @@ pub fn environment(set: &str, reps: usize) -> serde_json::Value {
     })
 }
 
-/// `compile_bench.json` ({environment, programs}) and `compile_bench.csv` (one row per program,
-/// columns in name order; the compile times joined with `;`).
+/// `compile_bench.json` ({environment, summary, programs}) and `compile_bench.csv` (one row per
+/// program, columns in name order; the compile times joined with `;`).
 pub fn write(dir: &std::path::Path, env: &serde_json::Value, rows: &[Row]) {
     std::fs::create_dir_all(dir).unwrap();
     let programs: Vec<serde_json::Value> = rows.iter().map(|r| serde_json::to_value(r).unwrap()).collect();
-    let json = serde_json::json!({ "environment": env, "programs": programs });
+    let json = serde_json::json!({ "environment": env, "summary": summary(rows), "programs": programs });
     std::fs::write(dir.join("compile_bench.json"), serde_json::to_string_pretty(&json).unwrap() + "\n").unwrap();
     let cell = |v: &serde_json::Value| match v {
         serde_json::Value::Array(a) => a.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(";"),

@@ -230,11 +230,12 @@ fn dxc_compiles_the_generated_programs() {
         runner::skip_test("no DXC");
         return;
     }
-    let set = std::env::var("XCL_COMPILE_BENCH").unwrap_or_default();
-    let (cases, default_reps) = match set.as_str() {
-        "" => (measure::small(), 1),
-        "full" => (measure::full(), 3),
-        x => panic!("XCL_COMPILE_BENCH={x}: only `full` (or unset for the small set)"),
+    let var = std::env::var("XCL_COMPILE_BENCH").unwrap_or_default();
+    let (set, cases, default_reps) = match var.as_str() {
+        "" => ("small", measure::small(), 1),
+        "full" => ("full", measure::full(), 3),
+        "large" => ("large", measure::large(), 3),
+        x => panic!("XCL_COMPILE_BENCH={x}: only `full` or `large` (or unset for the small set)"),
     };
     let reps = std::env::var("XCL_COMPILE_BENCH_REPS").map(|r| r.parse().expect("XCL_COMPILE_BENCH_REPS")).unwrap_or(default_reps);
     let args_var = std::env::var("XCL_COMPILE_BENCH_DXC_ARGS").unwrap_or_default();
@@ -242,14 +243,18 @@ fn dxc_compiles_the_generated_programs() {
     let mut rows: Vec<measure::Row> = cases.iter().map(|c| measure::measure(c, reps, &args)).collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     assert_eq!(rows.len(), cases.len());
-    for r in &rows {
+    for r in measure::by_time(&rows) {
         println!(
             "{:<32} {:>6} insts {:>9} B HLSL {:>8} B DXIL  DXC {:>9.1} ms (min {:.1})",
             r.name, r.instructions, r.hlsl_bytes, r.dxil_bytes, r.dxc_ms_median, r.dxc_ms_min
         );
     }
+    let s = measure::summary(&rows);
+    println!(
+        "{} programs: DXC median {:.1} ms, p90 {:.1} ms, max {:.1} ms, total {:.1} ms; the slowest tenth takes {:.0} % of it",
+        s.programs, s.dxc_ms_median, s.dxc_ms_p90, s.dxc_ms_max, s.dxc_ms_total, s.slowest_tenth_share * 100.0
+    );
     if let Ok(dir) = std::env::var("XCL_COMPILE_BENCH_OUT") {
-        let set = if set.is_empty() { "small" } else { "full" };
         measure::write(std::path::Path::new(&dir), &measure::environment(set, reps), &rows);
         println!("written: {dir}\\compile_bench.json, compile_bench.csv");
     }
@@ -278,6 +283,7 @@ fn results_are_written_as_json_and_csv() {
     measure::write(&dir, &serde_json::json!({ "set": "small" }), &[row.clone(), measure::Row { name: "y".into(), ..row }]);
     let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("compile_bench.json")).unwrap()).unwrap();
     assert_eq!(json["environment"]["set"], "small");
+    assert_eq!((json["summary"]["programs"].as_u64(), json["summary"]["dxc_ms_max"].as_f64()), (Some(2), Some(2.0)));
     assert_eq!(json["programs"][1]["name"], "y");
     assert_eq!((json["programs"][0]["ops"].as_u64(), json["programs"][0]["dxil_bytes"].as_u64()), (Some(200), Some(300)), "knobs are flattened into the row");
     let csv = std::fs::read_to_string(dir.join("compile_bench.csv")).unwrap();
@@ -289,4 +295,58 @@ fn results_are_written_as_json_and_csv() {
     let col = |n: &str| first[header.iter().position(|h| *h == n).unwrap_or_else(|| panic!("no column {n}: {csv}"))];
     assert_eq!((col("name"), col("dxc_ms"), col("dxil_bytes"), col("wave64")), ("x", "2.0;1.0;3.0", "300", "true"));
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn timed(name: &str, dxc_ms_median: f64) -> measure::Row {
+    measure::Row {
+        name: name.into(),
+        knobs: Knobs::default(),
+        split_wave64: false,
+        mem_windows: 1,
+        structured: true,
+        instructions: 0,
+        blocks: 0,
+        code_bytes: 0,
+        hlsl_bytes: 0,
+        translate_ms: 0.0,
+        dxc_args: String::new(),
+        dxc_ms: vec![dxc_ms_median],
+        dxc_ms_median,
+        dxc_ms_min: dxc_ms_median,
+        dxil_bytes: 0,
+    }
+}
+
+#[test]
+fn the_summary_shows_the_slow_tail() {
+    // 20 programs of 1..=20 ms, out of order: the slowest tenth is 19 + 20 of 210 ms
+    let rows: Vec<measure::Row> = (1..=20).map(|i| timed(&format!("p{i:02}"), f64::from((i * 7) % 20 + 1))).collect();
+    let s = measure::summary(&rows);
+    assert_eq!(
+        (s.programs, s.dxc_ms_total, s.dxc_ms_median, s.dxc_ms_p90, s.dxc_ms_max),
+        (20, 210.0, 10.5, 18.0, 20.0)
+    );
+    assert!((s.slowest_tenth_share - 39.0 / 210.0).abs() < 1e-12, "{s:?}");
+    // one program: it is the median, the p90, the maximum and the whole tenth
+    let one = measure::summary(&[timed("a", 5.0)]);
+    assert_eq!((one.dxc_ms_median, one.dxc_ms_p90, one.dxc_ms_max, one.slowest_tenth_share), (5.0, 5.0, 5.0, 1.0));
+    assert_eq!(measure::summary(&[]).programs, 0);
+}
+
+#[test]
+fn rows_rank_from_the_slowest_compile() {
+    let rows = [timed("b", 1.0), timed("c", 9.0), timed("a", 1.0), timed("d", 4.0)];
+    let names: Vec<&str> = measure::by_time(&rows).iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["c", "d", "a", "b"]);
+}
+
+#[test]
+fn the_large_set_is_the_tail_in_both_forms() {
+    let cases = measure::large();
+    let names: std::collections::BTreeSet<&str> = cases.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names.len(), cases.len(), "names are unique");
+    assert!(cases.iter().all(|c| c.knobs.ops >= 8000), "only large programs");
+    assert_eq!(cases.iter().map(|c| c.knobs.ops).max(), Some(40000));
+    let split = cases.iter().filter(|c| c.options.split_wave64 && c.options.mem_windows == 4).count();
+    assert_eq!((cases.len(), split), (18, 9), "each program native and split, 4 windows");
 }

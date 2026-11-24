@@ -3,11 +3,12 @@
 # writes compile_bench.json / .csv and the log to the output folder.
 #   .\scripts\compile_bench.ps1                       # full set, 3 compiles per program
 #   .\scripts\compile_bench.ps1 -Set small -Reps 1    # the set every test run uses
+#   .\scripts\compile_bench.ps1 -Set large            # only the multi-megabyte programs
 #   .\scripts\compile_bench.ps1 -DxcArgs '-O1'        # extra DXC arguments
 # Compare two runs (e.g. main and a PR's head, same machine):
 #   python -I scripts/compile_bench_compare.py <base>\compile_bench.json <head>\compile_bench.json
 param(
-    [ValidateSet('full', 'small')][string]$Set = 'full',
+    [ValidateSet('full', 'large', 'small')][string]$Set = 'full',
     [int]$Reps = 0,
     [string]$DxcArgs = '',
     [string]$Out = ''
@@ -22,7 +23,7 @@ if (-not $Out) { $Out = Join-Path 'target\compile_bench' ($commit.Substring(0, 1
 New-Item -ItemType Directory -Force $Out | Out-Null
 $log = Join-Path $Out 'compile_bench.log'
 
-$env:XCL_COMPILE_BENCH = if ($Set -eq 'full') { 'full' } else { '' }
+$env:XCL_COMPILE_BENCH = if ($Set -eq 'small') { '' } else { $Set }
 $env:XCL_COMPILE_BENCH_OUT = (Resolve-Path $Out).Path
 $env:XCL_COMPILE_BENCH_REPS = if ($Reps -gt 0) { "$Reps" } else { '' }
 $env:XCL_COMPILE_BENCH_DXC_ARGS = $DxcArgs

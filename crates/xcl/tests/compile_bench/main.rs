@@ -31,7 +31,8 @@ fn target(l: &Line) -> u64 {
 /// Instructions that the control flow and the prologue add (the rest are the operations).
 const CONTROL: &[&str] = &[
     "v_lshlrev_b32", "v_cmp_gt_u32", "s_and_saveexec_b64", "s_and_saveexec_b32", "s_cbranch_execz", "s_or_b64", "s_or_b32",
-    "s_mov_b32", "s_sub_u32", "s_cmp_lg_u32", "s_cbranch_scc1", "s_endpgm",
+    "s_mov_b32", "s_sub_u32", "s_cmp_lg_u32", "s_cbranch_scc1", "s_endpgm", "s_mov_b64", "s_and_b64", "s_and_b32",
+    "s_cbranch_execnz",
 ];
 
 #[derive(Debug, Default)]
@@ -41,6 +42,9 @@ struct Shape {
     if_depth: u32,
     loops: usize,
     loop_depth: u32,
+    divergent_loops: usize,
+    /// divergent loops whose branch is inside an `if`
+    loops_in_if: usize,
     lds: usize,
     mem: usize,
     buffer: usize,
@@ -70,6 +74,16 @@ fn shape(code: &[u8]) -> Shape {
                 let head = at(target(l));
                 assert!(head < i && mnemonic(&ls[head - 1]) == "s_mov_b32", "scc1 at {:#x}", l.pc);
                 loops.push((ls[head].pc, l.pc));
+            }
+            // a divergent loop's branch goes back to the instruction after its EXEC is saved,
+            // and EXEC is restored right after it
+            "s_cbranch_execnz" => {
+                let head = at(target(l));
+                let saves_exec = |m: &Line| m.text.contains("exec") && mnemonic(m).starts_with("s_mov_b");
+                assert!(head < i && saves_exec(&ls[head - 1]) && saves_exec(&ls[i + 1]), "execnz at {:#x}", l.pc);
+                loops.push((ls[head].pc, l.pc));
+                s.divergent_loops += 1;
+                s.loops_in_if += (depth > 0) as usize;
             }
             _ => {}
         }
@@ -349,4 +363,37 @@ fn the_large_set_is_the_tail_in_both_forms() {
     assert_eq!(cases.iter().map(|c| c.knobs.ops).max(), Some(40000));
     let split = cases.iter().filter(|c| c.options.split_wave64 && c.options.mem_windows == 4).count();
     assert_eq!((cases.len(), split), (18, 9), "each program native and split, 4 windows");
+}
+
+#[test]
+#[should_panic(expected = "loop body exceeds SOPP branch range")]
+fn oversized_divergent_loop_branches_are_refused() {
+    program(&Knobs { ops: 100_000, loops: 1, if_depth: 0, lds_pct: 0, mem_pct: 0, divergent_loops: true, ..Knobs::default() });
+}
+
+#[test]
+fn divergent_loops_leave_on_exec_and_translate_completely() {
+    for wave64 in [true, false] {
+        for (if_depth, loops, loop_depth) in [(0, 1, 1), (2, 2, 2), (4, 3, 3), (1, 1, 4)] {
+            let k = Knobs { ops: 600, if_depth, divergent_pct: 30, loops, loop_depth, divergent_loops: true, wave64, ..Knobs::default() };
+            let code = program(&k);
+            let s = shape(&code);
+            assert_eq!(s.ops, 600, "{k:?}");
+            // every loop leaves on EXEC, none on a counter, nested as deep as asked
+            assert_eq!((s.loops, s.divergent_loops, s.loop_depth), ((loops * loop_depth) as usize, (loops * loop_depth) as usize, loop_depth), "{k:?}");
+            assert!(s.if_depth <= if_depth && (if_depth == 0) == (s.ifs == 0), "{k:?}: {s:?}");
+            // with ifs, every loop runs inside one
+            assert_eq!(s.loops_in_if, if if_depth > 0 { s.divergent_loops } else { 0 }, "{k:?}");
+            let ms: Vec<String> = lines(&code).iter().map(|l| mnemonic(l).to_string()).collect();
+            let other = if wave64 { "s_and_b32" } else { "s_and_b64" };
+            assert!(!ms.iter().any(|m| m == other || m == "s_cbranch_scc1"), "{k:?}");
+            for structured in [true, false] {
+                let t = translate(&code, &Options { structured, ..k.options() }).unwrap_or_else(|e| panic!("{k:?}: {e}"));
+                assert!(t.complete(), "{k:?}: {:?}", t.unsupported_why);
+            }
+        }
+    }
+    // off, the same knobs give the uniform loops
+    let s = shape(&program(&Knobs { ops: 600, loops: 2, loop_depth: 2, ..Knobs::default() }));
+    assert_eq!((s.loops, s.divergent_loops), (4, 0));
 }

@@ -61,6 +61,7 @@ pub fn small() -> Vec<Case> {
         case("w64-split-4win", k(300), true, 4, true),
         case("loops", Knobs { loops: 2, loop_depth: 2, ..k(300) }, false, 1, true),
         case("divergent", Knobs { if_depth: 4, divergent_pct: 40, ..k(300) }, false, 1, true),
+        case("divergent-loops", Knobs { loops: 2, loop_depth: 2, divergent_loops: true, ..k(300) }, false, 1, true),
         case("cs-resources", Knobs { compute: true, buffer_pct: 10, image_pct: 5, ..k(300) }, false, 1, true),
     ]
 }
@@ -75,6 +76,7 @@ pub fn full() -> Vec<Case> {
             ("base", Knobs { ops, ..Knobs::default() }),
             ("divergent", Knobs { ops, if_depth: 6, divergent_pct: 40, ..Knobs::default() }),
             ("loops", Knobs { ops, loops: 4, loop_depth: 3, ..Knobs::default() }),
+            ("divergent-loops", Knobs { ops, loops: 4, loop_depth: 3, divergent_loops: true, ..Knobs::default() }),
             ("resources", Knobs { ops, compute: true, mem_pct: 10, buffer_pct: 10, image_pct: 5, ..Knobs::default() }),
             ("w32", Knobs { ops, wave64: false, ..Knobs::default() }),
         ];

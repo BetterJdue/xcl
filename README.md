@@ -192,7 +192,9 @@ part of the repository.
 
 **Shader compile time** without game data: `crates/xcl/tests/compile_bench` generates RDNA2
 programs (seeded; knobs for size, divergent branches, loops, wave size, LDS, memory, buffer and
-image accesses) and times their HLSL → DXIL compile. Every test run compiles a small set;
+image accesses) and times their HLSL → DXIL compile, and the same programs through the direct
+DXIL translator (`XCL_DIRECT_DXIL`) and the per-lane form (`XCL_PER_LANE`), with their refusals.
+Every test run compiles a small set;
 `scripts/compile_bench.ps1` runs the full one (or `-Set large`, only the multi-megabyte programs)
 in release and writes JSON / CSV and a log that ranks the programs by DXC time (median, p90 and
 maximum of the set), and

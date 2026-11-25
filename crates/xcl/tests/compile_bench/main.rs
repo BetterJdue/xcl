@@ -223,6 +223,11 @@ fn every_program_translates_completely() {
 const GOLDEN_DEFAULT: u64 = 0x2365_3488_bf15_5939;
 const GOLDEN_MIXED: u64 = 0xa184_a8b7_f231_29f2;
 
+/// A direct path in the printed table: its time and size, or why it refused.
+fn path(ms: f64, bytes: usize, refused: &str) -> String {
+    if refused.is_empty() { format!("{ms:.1} ms {bytes} B") } else { format!("refused ({refused})") }
+}
+
 #[test]
 fn dxc_compiles_the_generated_programs() {
     if let Err(e) = dxc::location() {
@@ -245,11 +250,25 @@ fn dxc_compiles_the_generated_programs() {
     assert_eq!(rows.len(), cases.len());
     for r in measure::by_time(&rows) {
         println!(
-            "{:<32} {:>6} insts {:>9} B HLSL {:>8} B DXIL  DXC {:>9.1} ms (min {:.1})",
-            r.name, r.instructions, r.hlsl_bytes, r.dxil_bytes, r.dxc_ms_median, r.dxc_ms_min
+            "{:<32} {:>6} insts {:>9} B HLSL {:>8} B DXIL  DXC {:>9.1} ms (min {:.1})  direct {}  per-lane {}",
+            r.name, r.instructions, r.hlsl_bytes, r.dxil_bytes, r.dxc_ms_median, r.dxc_ms_min,
+            path(r.direct_ms_median, r.direct_dxil_bytes, &r.direct_refused),
+            path(r.per_lane_ms_median, r.per_lane_dxil_bytes, &r.per_lane_refused)
         );
     }
+    // each direct path translated the program or says why not; the per-lane form only tries
+    // compute programs
+    for r in &rows {
+        assert_eq!(r.direct_refused.is_empty(), r.direct_dxil_bytes > 0, "{}: {}", r.name, r.direct_refused);
+        assert_eq!(r.per_lane_refused.is_empty(), r.per_lane_dxil_bytes > 0, "{}: {}", r.name, r.per_lane_refused);
+        assert_eq!(r.per_lane_refused == measure::NOT_COMPUTE, !r.knobs.compute, "{}", r.name);
+    }
     let s = measure::summary(&rows);
+    assert!(s.direct_translated > 0 && s.per_lane_translated > 0, "a direct path took none of the programs: {s:?}");
+    println!(
+        "direct DXIL: {} of {} programs, {:.1} ms; per-lane: {} translated, {} compute programs refused, {:.1} ms",
+        s.direct_translated, s.programs, s.direct_ms_total, s.per_lane_translated, s.per_lane_refused, s.per_lane_ms_total
+    );
     println!(
         "{} programs: DXC median {:.1} ms, p90 {:.1} ms, max {:.1} ms, total {:.1} ms; the slowest tenth takes {:.0} % of it",
         s.programs, s.dxc_ms_median, s.dxc_ms_p90, s.dxc_ms_max, s.dxc_ms_total, s.slowest_tenth_share * 100.0
@@ -278,6 +297,12 @@ fn results_are_written_as_json_and_csv() {
         dxc_ms_median: 2.0,
         dxc_ms_min: 1.0,
         dxil_bytes: 300,
+        direct_ms_median: 0.0,
+        direct_dxil_bytes: 0,
+        direct_refused: "x, y".into(),
+        per_lane_ms_median: 0.0,
+        per_lane_dxil_bytes: 0,
+        per_lane_refused: "x, y".into(),
     };
     let dir = std::env::temp_dir().join(format!("xcl_compile_bench_{}", std::process::id()));
     measure::write(&dir, &serde_json::json!({ "set": "small" }), &[row.clone(), measure::Row { name: "y".into(), ..row }]);
@@ -294,6 +319,7 @@ fn results_are_written_as_json_and_csv() {
     assert_eq!(header.len(), first.len(), "{csv}");
     let col = |n: &str| first[header.iter().position(|h| *h == n).unwrap_or_else(|| panic!("no column {n}: {csv}"))];
     assert_eq!((col("name"), col("dxc_ms"), col("dxil_bytes"), col("wave64")), ("x", "2.0;1.0;3.0", "300", "true"));
+    assert_eq!((col("direct_refused"), json["programs"][0]["direct_refused"].as_str()), ("x; y", Some("x, y")), "a comma in text does not split the CSV row");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -314,6 +340,12 @@ fn timed(name: &str, dxc_ms_median: f64) -> measure::Row {
         dxc_ms_median,
         dxc_ms_min: dxc_ms_median,
         dxil_bytes: 0,
+        direct_ms_median: 0.0,
+        direct_dxil_bytes: 0,
+        direct_refused: String::new(),
+        per_lane_ms_median: 0.0,
+        per_lane_dxil_bytes: 0,
+        per_lane_refused: String::new(),
     }
 }
 
@@ -334,6 +366,24 @@ fn the_summary_shows_the_slow_tail() {
 }
 
 #[test]
+fn the_summary_counts_the_direct_paths() {
+    let path = |name, direct: &str, per_lane: &str| measure::Row {
+        direct_ms_median: if direct.is_empty() { 2.0 } else { 0.0 },
+        direct_refused: direct.into(),
+        per_lane_ms_median: if per_lane.is_empty() { 3.0 } else { 0.0 },
+        per_lane_refused: per_lane.into(),
+        ..timed(name, 1.0)
+    };
+    let rows = [path("a", "", ""), path("b", "", "a value written while some lanes were elsewhere"), path("c", "panic: x", measure::NOT_COMPUTE)];
+    let s = measure::summary(&rows);
+    // a kernel the per-lane form does not take is not one of its refusals
+    assert_eq!(
+        (s.direct_translated, s.direct_ms_total, s.per_lane_translated, s.per_lane_ms_total, s.per_lane_refused),
+        (2, 4.0, 1, 3.0, 1)
+    );
+}
+
+#[test]
 fn rows_rank_from_the_slowest_compile() {
     let rows = [timed("b", 1.0), timed("c", 9.0), timed("a", 1.0), timed("d", 4.0)];
     let names: Vec<&str> = measure::by_time(&rows).iter().map(|r| r.name.as_str()).collect();
@@ -348,5 +398,5 @@ fn the_large_set_is_the_tail_in_both_forms() {
     assert!(cases.iter().all(|c| c.knobs.ops >= 8000), "only large programs");
     assert_eq!(cases.iter().map(|c| c.knobs.ops).max(), Some(40000));
     let split = cases.iter().filter(|c| c.options.split_wave64 && c.options.mem_windows == 4).count();
-    assert_eq!((cases.len(), split), (18, 9), "each program native and split, 4 windows");
+    assert_eq!((cases.len(), split), (24, 12), "each program native and split, 4 windows");
 }

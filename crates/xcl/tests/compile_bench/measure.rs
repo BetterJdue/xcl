@@ -1,5 +1,7 @@
 //! The measurement: each generated program is translated to HLSL and compiled with DXC, one
-//! compile at a time, and its sizes and times are written as JSON and CSV.
+//! compile at a time, and its sizes and times are written as JSON and CSV. The same program
+//! also goes through the two direct DXIL paths (#1426's translator, #1745's per-lane form),
+//! timed with the same repeats; a refusal is recorded, not a failure.
 //!
 //! - `XCL_COMPILE_BENCH=full`: the full set (sizes up to 20 000 operations); `large`: only the
 //!   multi-megabyte programs (up to 40 000 operations); unset: a small set that runs in seconds,
@@ -15,7 +17,9 @@
 use std::time::Instant;
 
 use serde::Serialize;
-use xcl::gpu::recomp::{dxc, translate, Options};
+use xcl::gpu::dxil::kernel::KernelOptions;
+use xcl::gpu::dxil::{coverage, validate};
+use xcl::gpu::recomp::{dxc, lower_dxil, translate, Mode, Options};
 
 use crate::gen::{program, Knobs};
 
@@ -37,6 +41,14 @@ pub struct Row {
     pub dxc_ms_median: f64,
     pub dxc_ms_min: f64,
     pub dxil_bytes: usize,
+    /// #1426's direct translator (`XCL_DIRECT_DXIL=1`): the same program straight to DXIL
+    pub direct_ms_median: f64,
+    pub direct_dxil_bytes: usize,
+    pub direct_refused: String,
+    /// #1745's per-lane form (`XCL_PER_LANE=1`); compute programs only, as in `pso.rs`
+    pub per_lane_ms_median: f64,
+    pub per_lane_dxil_bytes: usize,
+    pub per_lane_refused: String,
 }
 
 /// A program of the set: its name, knobs and the recompiler options it is translated with.
@@ -62,6 +74,8 @@ pub fn small() -> Vec<Case> {
         case("loops", Knobs { loops: 2, loop_depth: 2, ..k(300) }, false, 1, true),
         case("divergent", Knobs { if_depth: 4, divergent_pct: 40, ..k(300) }, false, 1, true),
         case("cs-resources", Knobs { compute: true, buffer_pct: 10, image_pct: 5, ..k(300) }, false, 1, true),
+        // what the per-lane form takes: no divergent ifs, no global or scalar memory
+        case("cs-uniform", Knobs { compute: true, if_depth: 0, mem_pct: 0, buffer_pct: 10, image_pct: 5, loops: 1, ..k(300) }, false, 1, true),
     ]
 }
 
@@ -76,6 +90,7 @@ pub fn full() -> Vec<Case> {
             ("divergent", Knobs { ops, if_depth: 6, divergent_pct: 40, ..Knobs::default() }),
             ("loops", Knobs { ops, loops: 4, loop_depth: 3, ..Knobs::default() }),
             ("resources", Knobs { ops, compute: true, mem_pct: 10, buffer_pct: 10, image_pct: 5, ..Knobs::default() }),
+            ("cs-uniform", Knobs { ops, compute: true, if_depth: 0, mem_pct: 0, buffer_pct: 10, image_pct: 5, loops: 1, ..Knobs::default() }),
             ("w32", Knobs { ops, wave64: false, ..Knobs::default() }),
         ];
         for (shape, knobs) in shapes {
@@ -91,7 +106,7 @@ pub fn full() -> Vec<Case> {
     v
 }
 
-/// The large set: only the multi-megabyte tail, where most of the compile time goes. Three
+/// The large set: only the multi-megabyte tail, where most of the compile time goes. Four
 /// shapes at 8 000, 20 000 and 40 000 operations, in both forms; the larger ones cross the
 /// source sizes at which `dxc.rs` lowers the optimisation level.
 pub fn large() -> Vec<Case> {
@@ -101,6 +116,7 @@ pub fn large() -> Vec<Case> {
             ("base", Knobs { ops, ..Knobs::default() }),
             ("divergent", Knobs { ops, if_depth: 6, divergent_pct: 40, ..Knobs::default() }),
             ("resources", Knobs { ops, compute: true, mem_pct: 10, buffer_pct: 10, image_pct: 5, ..Knobs::default() }),
+            ("cs-uniform", Knobs { ops, compute: true, if_depth: 0, mem_pct: 0, buffer_pct: 10, image_pct: 5, loops: 1, ..Knobs::default() }),
         ];
         for (shape, knobs) in shapes {
             v.push(case(&format!("{shape}-{ops}"), knobs.clone(), false, 1, true));
@@ -121,6 +137,13 @@ pub struct Summary {
     pub dxc_ms_p90: f64,
     pub dxc_ms_max: f64,
     pub slowest_tenth_share: f64,
+    /// programs each direct path translated (and their total time), and the compute programs
+    /// the per-lane form refused
+    pub direct_translated: usize,
+    pub direct_ms_total: f64,
+    pub per_lane_translated: usize,
+    pub per_lane_ms_total: f64,
+    pub per_lane_refused: usize,
 }
 
 pub fn summary(rows: &[Row]) -> Summary {
@@ -136,6 +159,11 @@ pub fn summary(rows: &[Row]) -> Summary {
         dxc_ms_p90: if n > 0 { t[(n * 9).div_ceil(10) - 1] } else { 0.0 },
         dxc_ms_max: t.last().copied().unwrap_or(0.0),
         slowest_tenth_share: if total > 0.0 { tenth / total } else { 0.0 },
+        direct_translated: rows.iter().filter(|r| r.direct_refused.is_empty()).count(),
+        direct_ms_total: rows.iter().map(|r| r.direct_ms_median).sum(),
+        per_lane_translated: rows.iter().filter(|r| r.per_lane_refused.is_empty()).count(),
+        per_lane_ms_total: rows.iter().map(|r| r.per_lane_ms_median).sum(),
+        per_lane_refused: rows.iter().filter(|r| !r.per_lane_refused.is_empty() && r.per_lane_refused != NOT_COMPUTE).count(),
     }
 }
 
@@ -173,6 +201,17 @@ pub fn measure(c: &Case, reps: usize, dxc_args: &[&str]) -> Row {
         assert!(!dxil.is_empty(), "{}: empty DXIL", c.name);
         assert_eq!(*dxil_bytes.get_or_insert(dxil.len()), dxil.len(), "{}: the DXIL size differs between compiles", c.name);
     }
+    let o = KernelOptions {
+        wave64: c.options.wave64,
+        split: c.options.wave64 && c.options.split_wave64,
+        mem_windows: c.options.mem_windows,
+        sampler_base: c.options.static_sampler_base,
+    };
+    let direct = direct_path(c, reps, || coverage::translate_mode(&code, &c.options.mode, o, false));
+    let per_lane = match &c.options.mode {
+        Mode::Compute(cs) => direct_path(c, reps, || lower_dxil::compute_with(&code, cs, o).map(|k| k.dxil)),
+        _ => (0.0, 0, NOT_COMPUTE.to_string()),
+    };
     Row {
         name: c.name.clone(),
         knobs: c.knobs.clone(),
@@ -189,7 +228,38 @@ pub fn measure(c: &Case, reps: usize, dxc_args: &[&str]) -> Row {
         dxc_ms_min: times.iter().copied().fold(f64::INFINITY, f64::min),
         dxc_ms: times,
         dxil_bytes: dxil_bytes.unwrap_or(0),
+        direct_ms_median: direct.0,
+        direct_dxil_bytes: direct.1,
+        direct_refused: direct.2,
+        per_lane_ms_median: per_lane.0,
+        per_lane_dxil_bytes: per_lane.1,
+        per_lane_refused: per_lane.2,
     }
+}
+
+/// The per-lane form takes compute programs only (`pso.rs`): the others are not refusals.
+pub const NOT_COMPUTE: &str = "not a compute program";
+
+/// One direct path `reps` times: (median ms, DXIL bytes, "") when it translates, or
+/// (0, 0, the first line of its refusal). A container the DXC
+/// validator refuses counts as a refusal (`validator: …`); the validation is not timed.
+fn direct_path(c: &Case, reps: usize, run: impl Fn() -> Result<Vec<u8>, String>) -> (f64, usize, String) {
+    let refused = |e: &str| (0.0, 0, e.lines().next().unwrap_or("").to_string());
+    let mut times = Vec::new();
+    let mut dxil = Vec::new();
+    for _ in 0..reps {
+        let t0 = Instant::now();
+        match run() {
+            Ok(d) => dxil = d,
+            Err(e) => return refused(&e),
+        }
+        times.push(ms(t0));
+    }
+    assert_eq!(run().as_deref(), Ok(dxil.as_slice()), "{}: the direct DXIL differs between two translations", c.name);
+    if let Err(e) = validate::validate(&dxil) {
+        return refused(&format!("validator: {e}"));
+    }
+    (median(&times), dxil.len(), String::new())
 }
 
 fn git(args: &[&str]) -> String {
@@ -219,7 +289,7 @@ pub fn environment(set: &str, reps: usize) -> serde_json::Value {
 }
 
 /// `compile_bench.json` ({environment, summary, programs}) and `compile_bench.csv` (one row per
-/// program, columns in name order; the compile times joined with `;`).
+/// program, columns in name order; the compile times joined with `;`, commas in text made `;`).
 pub fn write(dir: &std::path::Path, env: &serde_json::Value, rows: &[Row]) {
     std::fs::create_dir_all(dir).unwrap();
     let programs: Vec<serde_json::Value> = rows.iter().map(|r| serde_json::to_value(r).unwrap()).collect();
@@ -227,7 +297,7 @@ pub fn write(dir: &std::path::Path, env: &serde_json::Value, rows: &[Row]) {
     std::fs::write(dir.join("compile_bench.json"), serde_json::to_string_pretty(&json).unwrap() + "\n").unwrap();
     let cell = |v: &serde_json::Value| match v {
         serde_json::Value::Array(a) => a.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(";"),
-        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::String(s) => s.replace(',', ";"),
         x => x.to_string(),
     };
     let mut csv = String::new();

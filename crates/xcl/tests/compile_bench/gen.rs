@@ -35,6 +35,10 @@ pub struct Knobs {
     /// percent of operations that are buffer loads / stores (V#), and image loads / samples (T#)
     pub buffer_pct: u32,
     pub image_pct: u32,
+    /// percent of operations that are of the kinds the direct paths may refuse: VOP3 with
+    /// neg / abs modifiers, f16 (V_MUL_F16, V_PK_MUL_F16, V_CVT_F16_F32), a DPP row shift,
+    /// V_READLANE_B32
+    pub special_pct: u32,
     /// translate as a compute shader (64 threads, 4 user SGPRs) instead of a kernel
     pub compute: bool,
 }
@@ -43,7 +47,7 @@ impl Default for Knobs {
     fn default() -> Self {
         Knobs {
             seed: 1, ops: 200, if_depth: 2, divergent_pct: 10, loops: 0, loop_depth: 1, loop_trips: 4, wave64: true, vgprs: 16, sgprs: 8,
-            lds_pct: 5, mem_pct: 10, buffer_pct: 0, image_pct: 0, compute: false,
+            lds_pct: 5, mem_pct: 10, buffer_pct: 0, image_pct: 0, special_pct: 0, compute: false,
         }
     }
 }
@@ -129,6 +133,18 @@ impl Gen<'_> {
                 inst("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", self.vgpr()), ("VADDR", 0), ("SRSRC", 10), ("SSAMP", 12), ("DMASK", 1), ("DIM", 1)], None)
             };
         }
+        if r < resources + self.k.image_pct + self.k.special_pct {
+            let (d, a, b, c) = (self.vgpr(), self.vgpr(), self.vgpr(), self.vgpr());
+            return match self.rng.below(6) {
+                0 => inst("V_FMA_F32", "ENC_VOP3", &[("VDST", d), ("SRC0", V + a), ("SRC1", V + b), ("SRC2", V + c), ("NEG", 1 + self.rng.below(7)), ("ABS", self.rng.below(8))], None),
+                1 => inst("V_MUL_F16", "ENC_VOP2", &[("VDST", d), ("SRC0", V + a), ("VSRC1", b)], None),
+                2 => inst("V_PK_MUL_F16", "ENC_VOP3P", &[("VDST", d), ("SRC0", V + a), ("SRC1", V + b), ("OP_SEL_HI", 3)], None),
+                3 => inst("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", d), ("SRC0", V + a)], None),
+                // row_shr:1
+                4 => inst("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", d), ("SRC0", 0xFA), ("VSRC0", a), ("DPP_CTRL", 0x111), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+                _ => inst("V_READLANE_B32", "ENC_VOP3", &[("VDST", self.sgpr()), ("SRC0", V + a), ("SRC1", 128 + self.rng.below(32))], None),
+            };
+        }
         // the rest: about one scalar operation for three vector ones, as in console programs
         if self.rng.below(4) == 0 {
             let name = ["S_ADD_U32", "S_XOR_B32", "S_MUL_I32"][self.rng.below(3) as usize];
@@ -197,7 +213,7 @@ impl Gen<'_> {
 pub fn program(k: &Knobs) -> Vec<u8> {
     assert!((2..=254).contains(&k.vgprs) && (1..=16).contains(&k.sgprs), "{k:?}");
     assert!((1..=64).contains(&k.loop_trips) && k.loop_depth >= 1 && k.if_depth <= 8 && k.loop_depth <= 8, "{k:?}");
-    assert!(k.lds_pct + k.mem_pct + k.buffer_pct + k.image_pct <= 100 && k.divergent_pct <= 100, "{k:?}");
+    assert!(k.lds_pct + k.mem_pct + k.buffer_pct + k.image_pct + k.special_pct <= 100 && k.divergent_pct <= 100, "{k:?}");
     let mut g = Gen { k, rng: Rng(k.seed) };
     let mut v = inst("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None); // v1 = lane * 4
     let (loops, levels) = (k.loops as usize, k.loop_depth as usize);

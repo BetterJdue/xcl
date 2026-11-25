@@ -381,6 +381,8 @@ fn the_summary_counts_the_direct_paths() {
         (s.direct_translated, s.direct_ms_total, s.per_lane_translated, s.per_lane_ms_total, s.per_lane_refused),
         (2, 4.0, 1, 3.0, 1)
     );
+    let reasons: Vec<(&str, usize)> = s.refusals.iter().map(|(k, &n)| (k.as_str(), n)).collect();
+    assert_eq!(reasons, [("direct: panic: x", 1), ("per-lane: a value written while some lanes were elsewhere", 1)]);
 }
 
 #[test]
@@ -399,4 +401,27 @@ fn the_large_set_is_the_tail_in_both_forms() {
     assert_eq!(cases.iter().map(|c| c.knobs.ops).max(), Some(40000));
     let split = cases.iter().filter(|c| c.options.split_wave64 && c.options.mem_windows == 4).count();
     assert_eq!((cases.len(), split), (24, 12), "each program native and split, 4 windows");
+}
+
+#[test]
+fn special_operations_follow_the_knob_and_translate_completely() {
+    const SPECIAL: &[&str] = &["v_fma_f32", "v_mul_f16", "v_pk_mul_f16", "v_cvt_f16_f32", "v_mov_b32_dpp", "v_readlane_b32"];
+    let count = |k: &Knobs| lines(&program(k)).iter().filter(|l| SPECIAL.contains(&mnemonic(l))).count();
+    let all = Knobs { ops: 2000, lds_pct: 0, mem_pct: 0, special_pct: 100, ..Knobs::default() };
+    assert_eq!(count(&all), 2000);
+    let kinds: std::collections::BTreeSet<String> = lines(&program(&all)).iter().map(|l| mnemonic(l).to_string()).filter(|m| SPECIAL.contains(&m.as_str())).collect();
+    assert_eq!(kinds.len(), SPECIAL.len(), "{kinds:?}");
+    // off, only the plain V_FMA_F32 of the ordinary operations is among them
+    let off = lines(&program(&Knobs { ops: 2000, ..Knobs::default() }));
+    assert!(off.iter().all(|l| !SPECIAL[1..].contains(&mnemonic(l))));
+    for wave64 in [true, false] {
+        for compute in [false, true] {
+            let k = Knobs { ops: 400, special_pct: 30, wave64, compute, ..Knobs::default() };
+            let code = program(&k);
+            for structured in [true, false] {
+                let t = translate(&code, &Options { structured, ..k.options() }).unwrap_or_else(|e| panic!("{k:?}: {e}"));
+                assert!(t.complete(), "{k:?}: {:?}", t.unsupported_why);
+            }
+        }
+    }
 }

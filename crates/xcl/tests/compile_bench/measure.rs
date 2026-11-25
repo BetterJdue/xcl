@@ -76,6 +76,8 @@ pub fn small() -> Vec<Case> {
         case("cs-resources", Knobs { compute: true, buffer_pct: 10, image_pct: 5, ..k(300) }, false, 1, true),
         // what the per-lane form takes: no divergent ifs, no global or scalar memory
         case("cs-uniform", Knobs { compute: true, if_depth: 0, mem_pct: 0, buffer_pct: 10, image_pct: 5, loops: 1, ..k(300) }, false, 1, true),
+        // the same with the operations the direct paths may refuse
+        case("cs-special", Knobs { compute: true, if_depth: 0, mem_pct: 0, buffer_pct: 10, image_pct: 5, special_pct: 20, loops: 1, ..k(300) }, false, 1, true),
     ]
 }
 
@@ -91,6 +93,7 @@ pub fn full() -> Vec<Case> {
             ("loops", Knobs { ops, loops: 4, loop_depth: 3, ..Knobs::default() }),
             ("resources", Knobs { ops, compute: true, mem_pct: 10, buffer_pct: 10, image_pct: 5, ..Knobs::default() }),
             ("cs-uniform", Knobs { ops, compute: true, if_depth: 0, mem_pct: 0, buffer_pct: 10, image_pct: 5, loops: 1, ..Knobs::default() }),
+            ("cs-special", Knobs { ops, compute: true, if_depth: 0, mem_pct: 0, buffer_pct: 10, image_pct: 5, special_pct: 20, loops: 1, ..Knobs::default() }),
             ("w32", Knobs { ops, wave64: false, ..Knobs::default() }),
         ];
         for (shape, knobs) in shapes {
@@ -144,6 +147,8 @@ pub struct Summary {
     pub per_lane_translated: usize,
     pub per_lane_ms_total: f64,
     pub per_lane_refused: usize,
+    /// how many programs each refusal reason stopped, as `direct: …` / `per-lane: …`
+    pub refusals: std::collections::BTreeMap<String, usize>,
 }
 
 pub fn summary(rows: &[Row]) -> Summary {
@@ -164,6 +169,14 @@ pub fn summary(rows: &[Row]) -> Summary {
         per_lane_translated: rows.iter().filter(|r| r.per_lane_refused.is_empty()).count(),
         per_lane_ms_total: rows.iter().map(|r| r.per_lane_ms_median).sum(),
         per_lane_refused: rows.iter().filter(|r| !r.per_lane_refused.is_empty() && r.per_lane_refused != NOT_COMPUTE).count(),
+        refusals: rows
+            .iter()
+            .flat_map(|r| [("direct", &r.direct_refused), ("per-lane", &r.per_lane_refused)])
+            .filter(|(_, why)| !why.is_empty() && *why != NOT_COMPUTE)
+            .fold(Default::default(), |mut m, (path, why)| {
+                *m.entry(format!("{path}: {why}")).or_insert(0) += 1;
+                m
+            }),
     }
 }
 

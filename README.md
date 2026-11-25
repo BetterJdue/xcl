@@ -163,7 +163,8 @@ image accesses) and times their HLSL → DXIL compile. Every test run compiles a
 `scripts/compile_bench.ps1` runs the full one (or `-Set large`, only the multi-megabyte programs)
 in release and writes JSON / CSV and a log that ranks the programs by DXC time (median, p90 and
 maximum of the set), and
-`scripts/compile_bench_compare.py` compares two runs program by program (e.g. `main` and a
+`scripts/compile_bench_compare.py` compares two runs program by program (any size change, and
+time changes beyond the run-to-run noise, 5 % unless `--noise` says otherwise; e.g. `main` and a
 branch, on the same machine):
 
 ```powershell

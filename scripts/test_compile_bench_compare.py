@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import math
 import tempfile
@@ -30,6 +32,15 @@ class CompareTests(unittest.TestCase):
         r = compare({"a": program("a"), "old": program("old")}, {"a": program("a"), "new": program("new")})
         self.assertEqual((["old"], ["new"]), (r["only_base"], r["only_head"]))
         self.assertEqual(1, len(r["rows"]))
+
+    def test_a_time_change_counts_only_beyond_the_noise(self):
+        base = {n: program(n, dxc=100.0) for n in "abcd"}
+        head = {"a": program("a", dxc=104.0), "b": program("b", dxc=110.0), "c": program("c", dxc=90.0), "d": program("d", hlsl=999, dxc=100.0)}
+        r = compare(base, head, noise=0.05)
+        self.assertEqual(["", "time", "time", "size"], [row["changed"] for row in r["rows"]])
+        self.assertEqual((1, 2), (r["size_changes"], r["time_changes"]))
+        # a wider noise band leaves only the size change
+        self.assertEqual(["", "", "", "size"], [row["changed"] for row in compare(base, head, noise=0.2)["rows"]])
 
     def test_geomean_skips_missing_ratios(self):
         self.assertAlmostEqual(2.0, geomean([2.0, math.nan, 0.0]))
@@ -65,6 +76,11 @@ class RenderTests(unittest.TestCase):
             (Path(d) / "bad.json").write_text("{", encoding="utf-8")
             self.assertEqual(2, main([str(p), str(Path(d) / "bad.json")]))
             self.assertEqual(2, main([str(p)]))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(0, main([str(p), str(p), "--noise", "0.1"]))
+            self.assertIn("more than 10 % (the noise)", out.getvalue())
+            self.assertEqual(2, main([str(p), str(p), "--noise", "x"]))
 
 
 if __name__ == "__main__":
